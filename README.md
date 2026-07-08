@@ -1,6 +1,6 @@
 <span align="center">
 
-<a href="https://github.com/plmilord/Hass.io-custom-component-spaclient"><img src="https://raw.githubusercontent.com/plmilord/Hass.io-custom-component-spaclient/master/images/icon.png" width="150"></a>
+<a href="https://github.com/plmilord/Hass.io-custom-component-spaclient"><img src="https://raw.githubusercontent.com/plmilord/Hass.io-custom-component-spaclient/master/brand/icon.png" width="150"></a>
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Default-orange.svg)](https://github.com/hacs/integration)
 [![GitHub release](https://img.shields.io/github/release/plmilord/Hass.io-custom-component-spaclient.svg)](https://GitHub.com/plmilord/Hass.io-custom-component-spaclient/releases/)
