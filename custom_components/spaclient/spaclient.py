@@ -1,21 +1,24 @@
 """Spa Client integration."""
 import asyncio
+from contextlib import suppress
 import homeassistant.util.dt as dt_util
-import socket
 
 # Import the device class from the component that you want to support
 from .const import _LOGGER
 from homeassistant.const import UnitOfTemperature
 from homeassistant.util.unit_conversion import TemperatureConverter
-from threading import Lock
+
+IO_TIMEOUT = 5
+REQUEST_TIMEOUT = 15
 
 
 class spaclient:
     def __init__(self, host_ip):
         """ Socket variables """
         self.socket_is_connected = False
-        self.socket_l = Lock()
+        self.socket_l = asyncio.Lock()
         self.socket_s = None
+        self._reader = None
         self.socket_host_ip = host_ip
 
         """ Status update variable """
@@ -123,35 +126,49 @@ class spaclient:
         self.gfci_test_loaded = False
 
     async def get_socket(self):
-        if self.socket_s is None:
-            self.socket_s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket_s.settimeout(5)
-
+        if self.socket_s is not None:
+            return True
         try:
-            self.socket_s.connect((self.socket_host_ip, 4257))
-            return True
-        except (socket.timeout, socket.error) as e:
-            #_LOGGER.error("Socket connection error: %s", e) #Validation point
-            self.socket_is_connected = False
+            async with asyncio.timeout(IO_TIMEOUT):
+                self._reader, self.socket_s = await asyncio.open_connection(
+                    self.socket_host_ip, 4257
+                )
+        except (OSError, TimeoutError) as err:
+            _LOGGER.debug("Spa connection failed: %s", err)
+            self._disconnect()
+            return False
+        return True
+
+    def _disconnect(self):
+        """Close the transport without blocking the event loop."""
+        self.socket_is_connected = False
+        self.status_chunk_array = []
+        if self.socket_s is not None:
             self.socket_s.close()
-            self.socket_s = None
-            return True
+        self.socket_s = None
+        self._reader = None
+
+    async def close(self):
+        """Release the connection after its background tasks have stopped."""
+        writer = self.socket_s
+        self._disconnect()
+        if writer is not None:
+            with suppress(OSError, TimeoutError):
+                async with asyncio.timeout(IO_TIMEOUT):
+                    await writer.wait_closed()
 
     async def validate_connection(self):
-        count = 0
-
-        await self.get_socket()
-
-        if self.socket_s is not None:
-            while count < 20 or self.socket_is_connected == False:
-                self.read_msg()
-                await asyncio.sleep(.1)
-                count += 1
-
-            if self.socket_is_connected == False:
-                self.socket_s.close()
-                self.socket_s = None
-
+        try:
+            async with asyncio.timeout(REQUEST_TIMEOUT):
+                if not await self.get_socket():
+                    return False
+                while not self.socket_is_connected:
+                    if not await self.read_msg():
+                        return False
+                    await asyncio.sleep(0)
+        except TimeoutError:
+            self._disconnect()
+            return False
         return self.socket_is_connected
 
     async def keep_alive_call(self):
@@ -159,7 +176,10 @@ class spaclient:
             if self.socket_s is None:
                 await self.get_socket()
             else:
-                await self.send_fault_log_request()
+                try:
+                    await self.send_fault_log_request()
+                except (ConnectionError, TimeoutError):
+                    self._disconnect()
             await asyncio.sleep(30)
 
     def compute_checksum(self, length, payload):
@@ -178,40 +198,45 @@ class spaclient:
                 crc ^= 0x07
         return crc ^ 0x02
 
-    def read_msg(self):
-        self.socket_l.acquire()
+    async def read_msg(self):
+        """Read one complete frame, including when TCP fragments a message."""
+        async with self.socket_l:
+            reader = self._reader
+            if reader is None:
+                return False
+            try:
+                async with asyncio.timeout(IO_TIMEOUT):
+                    while await reader.readexactly(1) != b'\x7e':
+                        pass
+                    length = (await reader.readexactly(1))[0]
+                    if length < 5:
+                        return True
+                    chunk = await reader.readexactly(length)
+            except (OSError, EOFError, TimeoutError) as err:
+                _LOGGER.debug("Spa connection lost: %s", err)
+                if self._reader is reader:
+                    self._disconnect()
+                return False
+            except asyncio.CancelledError:
+                # A cancelled partial read cannot safely resume framing.
+                if self._reader is reader:
+                    self._disconnect()
+                raise
 
-        try:
-            len_chunk = self.socket_s.recv(2)
-        except (socket.timeout, socket.error) as e:
-            #_LOGGER.error("self.socket_s.recv(2) error = %s", e) #Validation point
-            self.socket_is_connected = False
-            self.socket_l.release()
-            self.socket_s.close()
-            self.socket_s = None
-            return True
+            if self._reader is not reader:
+                return False
+            if chunk[-1] != 0x7e or chunk[-2] != self.compute_checksum(
+                length - 1, bytes([length]) + chunk[:-2]
+            ):
+                _LOGGER.debug("Ignoring invalid spa frame")
+                return True
+            try:
+                return self._process_message(chunk)
+            except (IndexError, ValueError):
+                _LOGGER.debug("Ignoring malformed spa payload", exc_info=True)
+                return True
 
-        if len_chunk == b'~' or len_chunk == b'' or len(len_chunk) == 0:
-            self.socket_l.release()
-            return True
-
-        length = len_chunk[1]
-
-        if int(length) == 0:
-            self.socket_l.release()
-            return True
-
-        try:
-            chunk = self.socket_s.recv(length)
-        except (socket.timeout, socket.error) as e:
-            #_LOGGER.error("self.socket_s.recv(length) error = %s", e) #Validation point
-            self.socket_is_connected = False
-            self.socket_l.release()
-            self.socket_s.close()
-            self.socket_s = None
-            return True
-
-        self.socket_l.release()
+    def _process_message(self, chunk):
 
         if chunk != self.status_chunk_array:
             if chunk[0:3] == b'\xff\xaf\x13' and ((self.information_loaded and self.additional_information_loaded and self.preferences_loaded and self.configuration_loaded and self.module_identification_loaded) or (self.socket_is_connected == False)):
@@ -266,7 +291,7 @@ class spaclient:
     async def read_all_msg(self):
         while True:
             if self.socket_s is not None:
-                self.read_msg()
+                await self.read_msg()
             await asyncio.sleep(.1)
 
 
@@ -808,19 +833,27 @@ class spaclient:
 
 
     async def send_additional_information_request(self):
-        self.send_message(b'\x0a\xbf\x22', b'\x04' + b'\x00' + b'\x00')
-        while self.additional_information_loaded == False:
-            self.read_msg()
+        await self._request(b'\x0a\xbf\x22', b'\x04\x00\x00', "additional_information_loaded")
 
     async def send_configuration_request(self):
-        self.send_message(b'\x0a\xbf\x22', b'\x00' + b'\x00' + b'\x01')
-        while self.configuration_loaded == False:
-            self.read_msg()
+        await self._request(b'\x0a\xbf\x22', b'\x00\x00\x01', "configuration_loaded")
 
     async def send_fault_log_request(self):
-        self.send_message(b'\x0a\xbf\x22', b'\x20' + b'\x00' + b'\x00')
-        while self.fault_log_loaded == False:
-            self.read_msg()
+        await self._request(b'\x0a\xbf\x22', b'\x20\x00\x00', "fault_log_loaded")
+
+    async def _request(self, message_type, payload, loaded_attribute):
+        """Wait a bounded time for initialization replies, without blocking HA."""
+        try:
+            async with asyncio.timeout(REQUEST_TIMEOUT):
+                self.send_message(message_type, payload)
+                while not getattr(self, loaded_attribute):
+                    if not await self.read_msg():
+                        raise ConnectionError("Spa disconnected while waiting for a reply")
+                    # Buffered status frames must not starve other tasks or the timeout.
+                    await asyncio.sleep(0)
+        except (ConnectionError, TimeoutError):
+            self._disconnect()
+            raise
 
     def send_filter_cycles_config(self):
         self.send_message(b'\x0a\xbf\x23',
@@ -835,47 +868,35 @@ class spaclient:
         )
 
     async def send_filter_cycles_request(self):
-        self.send_message(b'\x0a\xbf\x22', b'\x01' + b'\x00' + b'\x00')
-        while self.filter_cycles_loaded == False:
-            self.read_msg()
+        await self._request(b'\x0a\xbf\x22', b'\x01\x00\x00', "filter_cycles_loaded")
 
     async def send_gfci_test_request(self):
-        self.send_message(b'\x0a\xbf\x22', b'\x80' + b'\x00' + b'\x00')
-        while self.gfci_test_loaded == False:
-            self.read_msg()
+        await self._request(b'\x0a\xbf\x22', b'\x80\x00\x00', "gfci_test_loaded")
 
     async def send_information_request(self):
-        self.send_message(b'\x0a\xbf\x22', b'\x02' + b'\x00' + b'\x00')
-        while self.information_loaded == False:
-            self.read_msg()
+        await self._request(b'\x0a\xbf\x22', b'\x02\x00\x00', "information_loaded")
 
     def send_message(self, type, payload):
+        if self.socket_s is None or self.socket_s.is_closing():
+            raise ConnectionError("Spa is not connected")
         length = 5 + len(payload)
         checksum = self.compute_checksum(length - 1, bytes([length]) + type + payload)
         prefix = b'\x7e'
         message = prefix + bytes([length]) + type + payload + bytes([checksum]) + prefix
 
         try:
-            #_LOGGER.info("send_message : %s", message) #Validation point
-            self.socket_s.send(message)
+            # StreamWriter buffers the complete frame; it never waits for network I/O.
+            self.socket_s.write(message)
             return True
-        except (socket.timeout, socket.error) as e:
-            #_LOGGER.error("self.socket_s.send(message) error = %s", e) #Validation point
-            self.socket_is_connected = False
-            self.socket_l.release()
-            self.socket_s.close()
-            self.socket_s = None
-            return True
+        except OSError:
+            self._disconnect()
+            raise
 
     async def send_module_identification_request(self):
-        self.send_message(b'\x0a\xbf\x04', bytes([]))
-        while self.module_identification_loaded == False:
-            self.read_msg()
+        await self._request(b'\x0a\xbf\x04', b'', "module_identification_loaded")
 
     async def send_preferences_request(self):
-        self.send_message(b'\x0a\xbf\x22', b'\x08' + b'\x00' + b'\x00')
-        while self.preferences_loaded == False:
-            self.read_msg()
+        await self._request(b'\x0a\xbf\x22', b'\x08\x00\x00', "preferences_loaded")
 
     def send_toggle_message(self, item):
         self.send_message(b'\x0a\xbf\x11', bytes([item]) + b'\x00')

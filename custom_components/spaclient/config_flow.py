@@ -95,7 +95,10 @@ async def validate_input(hass, data):
 
     spa = spaclient(data[CONF_HOST])
 
-    connected = await spa.validate_connection()                          #To switch to development mode, comment out this line
+    try:
+        connected = await spa.validate_connection()
+    finally:
+        await spa.close()
 
     if not connected:                                                    #To switch to development mode, comment out this line
         raise CannotConnect                                              #To switch to development mode, comment out this line
