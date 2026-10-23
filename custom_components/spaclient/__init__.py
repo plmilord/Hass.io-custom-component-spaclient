@@ -7,7 +7,6 @@ import voluptuous as vol
 from .const import (
     _LOGGER,
     CONF_SYNC_TIME,
-    DATA_LISTENER,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     ICONS,
@@ -21,6 +20,7 @@ from homeassistant.const import (
     CONF_HOST,
     CONF_NAME,
     CONF_SCAN_INTERVAL,
+    EVENT_HOMEASSISTANT_STOP,
 )
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.entity import Entity
@@ -60,28 +60,45 @@ async def async_setup_entry(hass, config_entry):
     """Set up Spa Client from a config entry."""
 
     spa = spaclient(config_entry.data[CONF_HOST])
-    hass.data[DOMAIN][config_entry.entry_id] = {SPA: spa, DATA_LISTENER: [config_entry.add_update_listener(update_listener)]}
+    data = {SPA: spa, "tasks": [], "sync_time_task": None}
+    hass.data[DOMAIN][config_entry.entry_id] = data
 
-    connected = await spa.validate_connection()     #To switch to development mode, comment out this line
+    try:
+        if not await spa.validate_connection():
+            raise ConfigEntryNotReady("Unable to connect to the spa")
 
-    if not connected:                               #To switch to development mode, comment out this line
-        raise ConfigEntryNotReady                   #To switch to development mode, comment out this line
+        await spa.send_additional_information_request()
+        await spa.send_configuration_request()
+        await spa.send_fault_log_request()
+        await spa.send_filter_cycles_request()
+        await spa.send_gfci_test_request()
+        await spa.send_information_request()
+        await spa.send_module_identification_request()
+        await spa.send_preferences_request()
 
-    await spa.send_additional_information_request() #To switch to development mode, comment out this line
-    await spa.send_configuration_request()          #To switch to development mode, comment out this line
-    await spa.send_fault_log_request()              #To switch to development mode, comment out this line
-    await spa.send_filter_cycles_request()          #To switch to development mode, comment out this line
-    await spa.send_gfci_test_request()              #To switch to development mode, comment out this line
-    await spa.send_information_request()            #To switch to development mode, comment out this line
-    await spa.send_module_identification_request()  #To switch to development mode, comment out this line
-    await spa.send_preferences_request()            #To switch to development mode, comment out this line
+        data["tasks"] = [
+            hass.async_create_background_task(spa.keep_alive_call(), "spaclient keep alive"),
+            hass.async_create_background_task(spa.read_all_msg(), "spaclient reader"),
+        ]
+        await update_listener(hass, config_entry)
+        await hass.config_entries.async_forward_entry_setups(config_entry, SPACLIENT_COMPONENTS)
+    except (OSError, TimeoutError) as err:
+        await _async_close(data)
+        hass.data[DOMAIN].pop(config_entry.entry_id)
+        raise ConfigEntryNotReady("Spa did not respond during setup") from err
+    except BaseException:
+        await _async_close(data)
+        hass.data[DOMAIN].pop(config_entry.entry_id)
+        raise
 
-    await update_listener(hass, config_entry)
+    config_entry.async_on_unload(config_entry.add_update_listener(update_listener))
 
-    hass.loop.create_task(spa.keep_alive_call())
-    hass.loop.create_task(spa.read_all_msg())
+    async def async_stop(event):
+        await _async_close(data)
 
-    await hass.config_entries.async_forward_entry_setups(config_entry, SPACLIENT_COMPONENTS)
+    config_entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, async_stop)
+    )
 
     spa.print_variables()
     return True
@@ -90,25 +107,49 @@ async def async_setup_entry(hass, config_entry):
 async def async_unload_entry(hass, config_entry) -> bool:
     """Unload a config entry."""
 
-    hass.data[DOMAIN][config_entry.entry_id][DATA_LISTENER]:listener()
-
     if unload_ok := await hass.config_entries.async_unload_platforms(config_entry, SPACLIENT_COMPONENTS):
-        hass.data[DOMAIN].pop(config_entry.entry_id)
+        data = hass.data[DOMAIN].pop(config_entry.entry_id)
+        await _async_close(data)
     return unload_ok
+
+
+async def _async_close(data):
+    """Stop all readers and timers before closing the spa connection."""
+    tasks = list(data["tasks"])
+    if data["sync_time_task"] is not None:
+        tasks.append(data["sync_time_task"])
+    data["tasks"] = []
+    data["sync_time_task"] = None
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    await data[SPA].close()
 
 
 async def update_listener(hass, config_entry):
     """Handle options update."""
 
+    data = hass.data[DOMAIN][config_entry.entry_id]
+    if task := data["sync_time_task"]:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        data["sync_time_task"] = None
+
     if config_entry.options.get(CONF_SYNC_TIME):
-        spa = hass.data[DOMAIN][config_entry.entry_id][SPA]
+        spa = data[SPA]
 
         async def sync_time():
             while config_entry.options.get(CONF_SYNC_TIME):
-                await spa.set_current_time()
+                if spa.get_gateway_status():
+                    try:
+                        await spa.set_current_time()
+                    except OSError:
+                        _LOGGER.debug("Spa disconnected during time sync")
                 await asyncio.sleep(86400)
 
-        hass.loop.create_task(sync_time())
+        data["sync_time_task"] = hass.async_create_background_task(
+            sync_time(), "spaclient time sync"
+        )
 
 
 class SpaClientDevice(Entity):
